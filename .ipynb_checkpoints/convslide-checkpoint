@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Convert a whole-slide image (e.g. ``.mrxs``) to a pyramidal OME-TIFF.
+
+Pipeline: ``bioformats2raw`` writes an intermediate Zarr pyramid, then
+``raw2ometiff`` writes the final ``.tiff``. The intermediate directory is
+deleted afterwards (keep it with ``--keep-raw``).
+
+Example:
+
+    convslide "t/lam/Patologia Geral/80 Apoptose.mrxs" t/converter/ \
+        --raw_compression=3 --tiff_compression=0.40
+"""
+
+import argparse
+import logging
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+logger = logging.getLogger("slide_conv")
+
+def norm_str(s):
+    """Normalize a string for use :eas a file-name stem."""
+    if s is None:
+        return None
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower().strip()
+    s = s.replace(" ", "_")
+    return s
+
+
+class imageConv:
+    def __init__(self, in_file, out_path, env="remote"):
+        self.in_file = Path(in_file)
+        self.out_path = Path(out_path)
+        self.env = env
+        self.basecmd = ["conda", "run", "-n", self.env]
+        self.fname = norm_str(self.in_file.stem)
+        self.raw_out_path = self.out_path / f"{self.fname}_raw"
+        self.tiff_out_file = self.out_path / f"{self.fname}.tiff"
+
+    # ------------------------------------------------------------------ #
+    # command construction
+    # ------------------------------------------------------------------ #
+    def _build_conv2raw_cmd(
+        self, compression="blosc", cname="zstd", clevel=3, max_tiles=128, progress=True
+    ):
+        cmd = self.basecmd + [
+            "bioformats2raw",
+            str(self.in_file.resolve()),
+            str(self.raw_out_path.resolve()),
+            "--compression",
+            compression,
+            "--compression-properties",
+            f"cname={cname}",
+            "--compression-properties",
+            f"clevel={clevel}",
+            "--max-cached-tiles",
+            str(max_tiles),
+        ]
+        if progress:
+            cmd.append("-p")
+        return cmd
+
+    def _build_raw2tiff_cmd(
+        self, compression="JPEG", rgb=True, max_workers=8, quality=0.67, progress=True
+    ):
+        cmd = self.basecmd + [
+            "raw2ometiff",
+            str(self.raw_out_path.resolve()),
+            str(self.tiff_out_file.resolve()),
+            "--compression",
+            compression,
+            "--max_workers",
+            str(max_workers),
+            "--quality",
+            str(quality),
+        ]
+        if progress:
+            cmd.append("-p")
+        if rgb:
+            cmd.append("--rgb")
+        return cmd
+
+    @staticmethod
+    def _log_cmd(cmd):
+        print(shlex.join(cmd))
+
+    # ------------------------------------------------------------------ #
+    # stages
+    # ------------------------------------------------------------------ #
+    def conv2raw(
+        self,
+        compression="blosc",
+        cname="zstd",
+        clevel=3,
+        max_tiles=128,
+        dry_run=False,
+        progress=True,
+    ):
+        """Run ``bioformats2raw``, replacing any existing intermediate dir."""
+        if not dry_run and self.raw_out_path.exists():
+            shutil.rmtree(self.raw_out_path)
+
+        cmd = self._build_conv2raw_cmd(compression, cname, clevel, max_tiles, progress)
+        if dry_run:
+            self._log_cmd(cmd)
+            return None
+
+        logger.info("Running bioformats2raw -> %s", self.raw_out_path)
+        return subprocess.run(cmd, check=True)
+
+    def raw2tiff(
+        self,
+        compression="JPEG",
+        rgb=True,
+        max_workers=8,
+        quality=0.67,
+        dry_run=False,
+        progress=True,
+    ):
+        """Run ``raw2ometiff`` on the intermediate dir produced by :meth:`conv2raw`."""
+        if not dry_run and not self.raw_out_path.is_dir():
+            raise FileNotFoundError(
+                f"intermediate directory not found: {self.raw_out_path} "
+                "(run conv2raw first or use --keep-raw)"
+            )
+
+        if not dry_run and self.tiff_out_file.exists():
+            self.tiff_out_file.unlink()
+
+        cmd = self._build_raw2tiff_cmd(compression, rgb, max_workers, quality, progress)
+        if dry_run:
+            self._log_cmd(cmd)
+            return None
+
+        logger.info("Running raw2ometiff -> %s", self.tiff_out_file)
+        return subprocess.run(cmd, check=True)
+
+    def _remove_raw(self):
+        if self.raw_out_path.exists():
+            logger.debug("Removing intermediate directory %s", self.raw_out_path)
+            shutil.rmtree(self.raw_out_path)
+
+    # ------------------------------------------------------------------ #
+    # full pipeline
+    # ------------------------------------------------------------------ #
+    def convert(
+        self,
+        raw_codec="blosc",
+        raw_cname="zstd",
+        raw_compression=3,
+        max_cached_tiles=128,
+        tiff_codec="JPEG",
+        tiff_compression=0.67,
+        rgb=True,
+        max_workers=8,
+        keep_raw=False,
+        skip_existing=False,
+        dry_run=False,
+        progress=True,
+    ):
+        """Run both stages and clean up the intermediate dir.
+
+        ``raw_compression`` is the blosc ``clevel`` and ``tiff_compression``
+        is the raw2ometiff ``--quality``, matching the CLI flag names.
+        Returns 0 on success (or when the output already exists and
+        ``skip_existing`` is set).
+        """
+        if skip_existing and self.tiff_out_file.exists():
+            logger.info("Output already exists, skipping: %s", self.tiff_out_file)
+            return 0
+
+        try:
+            self.conv2raw(
+                compression=raw_codec,
+                cname=raw_cname,
+                clevel=raw_compression,
+                max_tiles=max_cached_tiles,
+                dry_run=dry_run,
+                progress=progress,
+            )
+            self.raw2tiff(
+                compression=tiff_codec,
+                rgb=rgb,
+                max_workers=max_workers,
+                quality=tiff_compression,
+                dry_run=dry_run,
+                progress=progress,
+            )
+        finally:
+            if not keep_raw and not dry_run:
+                self._remove_raw()
+        return 0
+
+
+# ---------------------------------------------------------------------- #
+# CLI
+# ---------------------------------------------------------------------- #
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="convslide",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="input slide image (any format bioformats2raw supports, e.g. .mrxs)",
+    )
+    parser.add_argument(
+        "output",
+        type=Path,
+        help="output directory; the final file is written as <normalized-stem>.tiff inside it",
+    )
+
+    raw = parser.add_argument_group("raw stage (bioformats2raw)")
+    raw.add_argument(
+        "--raw-compression", "--raw_compression",
+        type=int,
+        default=3,
+        metavar="LEVEL",
+        help="blosc compression level passed as clevel (default: %(default)s)",
+    )
+    raw.add_argument(
+        "--raw-codec",
+        default="blosc",
+        metavar="CODEC",
+        help="raw compression codec (default: %(default)s)",
+    )
+    raw.add_argument(
+        "--raw-cname",
+        default="zstd",
+        metavar="NAME",
+        help="blosc compressor name (default: %(default)s)",
+    )
+    raw.add_argument(
+        "--max-cached-tiles", "--max_cached_tiles",
+        type=int,
+        default=128,
+        metavar="N",
+        help="maximum cached tiles for bioformats2raw (default: %(default)s)",
+    )
+
+    tiff = parser.add_argument_group("tiff stage (raw2ometiff)")
+    tiff.add_argument(
+        "--tiff-compression", "--tiff_compression",
+        type=float,
+        default=0.67,
+        metavar="QUALITY",
+        help="JPEG quality for the final OME-TIFF, 0 < q <= 1 (default: %(default)s)",
+    )
+    tiff.add_argument(
+        "--tiff-codec",
+        default="JPEG",
+        metavar="CODEC",
+        help="tiff compression codec (default: %(default)s)",
+    )
+    tiff.add_argument(
+        "--max-workers", "--max_workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="worker threads for raw2ometiff (default: %(default)s)",
+    )
+    tiff.add_argument(
+        "--rgb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write RGB output (default: on; use --no-rgb to disable)",
+    )
+    tiff.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show the tools' progress bar, -p (default: on; use --no-progress to disable)",
+    )
+
+    runtime = parser.add_argument_group("runtime")
+    runtime.add_argument(
+        "--env",
+        default="remote",
+        metavar="NAME",
+        help="conda environment that provides bioformats2raw/raw2ometiff (default: %(default)s)",
+    )
+    runtime.add_argument(
+        "--keep-raw", "--keep_raw",
+        action="store_true",
+        help="keep the intermediate <stem>_raw directory after conversion",
+    )
+    runtime.add_argument(
+        "--skip-existing", "--skip_existing",
+        action="store_true",
+        help="skip conversion when the output .tiff already exists",
+    )
+    runtime.add_argument(
+        "--dry-run", "--dry_run",
+        action="store_true",
+        help="print the commands without running them",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=0,
+        help="increase logging (-v for info, -vv for debug)",
+    )
+    return parser
+
+
+def _validate_args(args, parser):
+    if not args.input.is_file():
+        parser.error(f"input does not exist or is not a file: {args.input}")
+    if not args.output.is_dir():
+        parser.error(f"output directory does not exist: {args.output}")
+    if args.raw_compression < 0:
+        parser.error("--raw-compression must be >= 0")
+    if args.max_cached_tiles < 1:
+        parser.error("--max-cached-tiles must be >= 1")
+    if args.max_workers < 1:
+        parser.error("--max-workers must be >= 1")
+    if not 0 < args.tiff_compression <= 1:
+        parser.error("--tiff-compression must be in (0, 1]")
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _validate_args(args, parser)
+
+    log_levels = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
+    logging.basicConfig(
+        level=log_levels.get(args.verbose, logging.DEBUG),
+        format="%(levelname)s: %(message)s",
+    )
+
+    conv = imageConv(args.input, args.output, env=args.env)
+    try:
+        return conv.convert(
+            raw_codec=args.raw_codec,
+            raw_cname=args.raw_cname,
+            raw_compression=args.raw_compression,
+            max_cached_tiles=args.max_cached_tiles,
+            tiff_codec=args.tiff_codec,
+            tiff_compression=args.tiff_compression,
+            rgb=args.rgb,
+            max_workers=args.max_workers,
+            keep_raw=args.keep_raw,
+            skip_existing=args.skip_existing,
+            dry_run=args.dry_run,
+            progress=args.progress,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("conversion failed (%s): %s", e.returncode, shlex.join(e.cmd))
+        return e.returncode or 1
+    except OSError as e:
+        logger.error("%s", e)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
