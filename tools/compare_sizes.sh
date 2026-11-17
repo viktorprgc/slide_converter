@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
-COMPRESSED_DIR='/mnt/t/lam_compr/'
-
+COMPRESSED_DIR='/mnt/t/Victor/lam_compr'
 
 compr_=( $(du -BM ${COMPRESSED_DIR}/* | cut --fields 1) )
 
 orig_=( $(cat done | xargs -I chunkfile cat chunks/chunkfile |\
-    xargs -I directory du -d0 -BM /mnt/t/lam/pato_ger/directory |\
+    xargs -I directory du -d0 -BM /mnt/t/Victor/lam/pato_ger/directory |\
     cut --fields 1) )
 
 round()
@@ -34,7 +33,7 @@ fi
 echo "Ocorreu uma redução de tamanho de $(round $reduction) vezes."
 
 echo "======================================================="
-echo "Tamanho original das imagens processadas:" $(round $reduction) "MBs"
+echo "Tamanho original das imagens processadas:" $(round $sum_orig) "MBs"
 echo "Tamanho após compressão:" $(round $sum_compr) "MBs"
 echo "-------------------------------------------------------"
 echo "Tamanho médio das imagens antes:" $(round $mean_orig)
